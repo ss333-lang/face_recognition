@@ -1,0 +1,30 @@
+# Virtual environment
+venv/
+
+# Uploaded and processed videos
+uploads/
+processed/
+actors/
+
+# YOLO model weights (auto-downloaded)
+yolov8n.pt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment variables (contains secrets)
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

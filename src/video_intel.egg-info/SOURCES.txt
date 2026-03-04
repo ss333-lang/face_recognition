@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+src/video_intel/__init__.py
+src/video_intel/celery_worker.py
+src/video_intel/database.py
+src/video_intel/main.py
+src/video_intel/pipeline.py
+src/video_intel.egg-info/PKG-INFO
+src/video_intel.egg-info/SOURCES.txt
+src/video_intel.egg-info/dependency_links.txt
+src/video_intel.egg-info/requires.txt
+src/video_intel.egg-info/top_level.txt
+tests/test_pipeline.py

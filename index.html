@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Video Intel</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0f0f0f;
+      color: #e0e0e0;
+      min-height: 100vh;
+    }
+
+    header {
+      background: #1a1a1a;
+      border-bottom: 1px solid #2a2a2a;
+      padding: 16px 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    header h1 {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+    }
+
+    header h1 span {
+      color: #e50914;
+    }
+
+    #health-bar {
+      display: flex;
+      gap: 12px;
+      font-size: 12px;
+    }
+
+    .pill {
+      padding: 3px 10px;
+      border-radius: 20px;
+      background: #2a2a2a;
+      color: #888;
+    }
+
+    .pill.ok {
+      background: #1a3a1a;
+      color: #4caf50;
+    }
+
+    .pill.error {
+      background: #3a1a1a;
+      color: #f44336;
+    }
+
+    main {
+      max-width: 900px;
+      margin: 40px auto;
+      padding: 0 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 28px;
+    }
+
+    .card {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 10px;
+      padding: 24px;
+    }
+
+    .card h2 {
+      font-size: 14px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #888;
+      margin-bottom: 18px;
+    }
+
+    label {
+      display: block;
+      font-size: 13px;
+      color: #aaa;
+      margin-bottom: 6px;
+    }
+
+    input[type="text"],
+    input[type="file"] {
+      width: 100%;
+      background: #111;
+      border: 1px solid #333;
+      border-radius: 6px;
+      color: #e0e0e0;
+      padding: 9px 12px;
+      font-size: 14px;
+      margin-bottom: 14px;
+    }
+
+    input[type="file"] {
+      cursor: pointer;
+    }
+
+    button {
+      background: #e50914;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 10px 20px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    button:hover {
+      background: #c5070f;
+    }
+
+    button:disabled {
+      background: #444;
+      cursor: not-allowed;
+    }
+
+    button.secondary {
+      background: #2a2a2a;
+      color: #ccc;
+    }
+
+    button.secondary:hover {
+      background: #333;
+    }
+
+    .progress-wrap {
+      margin-top: 16px;
+      display: none;
+    }
+
+    .progress-wrap.visible {
+      display: block;
+    }
+
+    .progress-label {
+      font-size: 12px;
+      color: #aaa;
+      margin-bottom: 6px;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .progress-bar-bg {
+      background: #2a2a2a;
+      border-radius: 4px;
+      height: 6px;
+      overflow: hidden;
+    }
+
+    .progress-bar-fill {
+      height: 100%;
+      background: #e50914;
+      border-radius: 4px;
+      transition: width 0.4s;
+      width: 0%;
+    }
+
+    .result-box {
+      margin-top: 20px;
+      background: #111;
+      border: 1px solid #2a2a2a;
+      border-radius: 6px;
+      padding: 16px;
+      font-size: 13px;
+      display: none;
+    }
+
+    .result-box.visible {
+      display: block;
+    }
+
+    .timeline-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+      padding: 12px 0;
+      border-bottom: 1px solid #2a2a2a;
+    }
+
+    .timeline-item:last-child {
+      border-bottom: none;
+    }
+
+    .timecode {
+      font-size: 11px;
+      color: #888;
+      min-width: 52px;
+      padding-top: 2px;
+      font-family: monospace;
+    }
+
+    .timeline-content {
+      flex: 1;
+    }
+
+    .timeline-faces {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+
+    .face-chip {
+      background: #1e2a3a;
+      color: #7ab8f5;
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-size: 12px;
+    }
+
+    .obj-chip {
+      background: #2a1e3a;
+      color: #c8a0f5;
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-size: 12px;
+    }
+
+    .timeline-objects {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .actors-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 4px;
+    }
+
+    .actor-chip {
+      background: #1e2a3a;
+      color: #7ab8f5;
+      border-radius: 20px;
+      padding: 4px 12px;
+      font-size: 12px;
+    }
+
+    .msg {
+      font-size: 13px;
+      margin-top: 10px;
+    }
+
+    .msg.ok {
+      color: #4caf50;
+    }
+
+    .msg.error {
+      color: #f44336;
+    }
+
+    .row {
+      display: flex;
+      gap: 12px;
+      align-items: flex-end;
+    }
+
+    .row>div {
+      flex: 1;
+    }
+
+    #video-id-display {
+      font-family: monospace;
+      font-size: 13px;
+      color: #7ab8f5;
+      background: #111;
+      border: 1px solid #2a2a2a;
+      border-radius: 4px;
+      padding: 6px 10px;
+      margin-top: 10px;
+      display: none;
+    }
+
+    #video-id-display.visible {
+      display: block;
+    }
+
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 12px;
+      color: #aaa;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+  </style>
+</head>
+
+<body>
+
+  <header>
+    <h1>Video <span>Intel</span></h1>
+    <div id="health-bar">
+      <span class="pill" id="pill-redis">Redis ...</span>
+      <span class="pill" id="pill-db">DB ...</span>
+      <span class="pill" id="pill-actors">Actors ...</span>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- Upload & Process -->
+    <div class="card">
+      <h2>1 — Upload &amp; Process Video</h2>
+      <label>Select a video file</label>
+      <input type="file" id="video-file" accept="video/*" />
+      <button id="btn-upload">Upload &amp; Start Processing</button>
+
+      <div id="video-id-display"></div>
+
+      <div class="progress-wrap" id="progress-wrap">
+        <div class="progress-label">
+          <span id="step-label">Queued...</span>
+          <span id="pct-label">0%</span>
+        </div>
+        <div class="progress-bar-bg">
+          <div class="progress-bar-fill" id="progress-fill"></div>
+        </div>
+      </div>
+
+      <div class="result-box" id="timeline-box">
+        <div id="timeline-content"></div>
+      </div>
+    </div>
+
+    <!-- Add Actor -->
+    <div class="card">
+      <h2>2 — Add Actor</h2>
+      <div class="row">
+        <div>
+          <label>Actor name</label>
+          <input type="text" id="actor-name" placeholder="e.g. Tom Hanks" />
+        </div>
+        <div>
+          <label>Reference photo (JPG/PNG, clear face)</label>
+          <input type="file" id="actor-photo" accept="image/*" />
+        </div>
+      </div>
+      <button id="btn-add-actor">Add Actor</button>
+      <div class="msg" id="actor-msg"></div>
+    </div>
+
+    <!-- Actors List -->
+    <div class="card">
+      <h2>3 — Registered Actors</h2>
+      <button class="secondary" id="btn-load-actors">Load Actors</button>
+      <div class="actors-grid" id="actors-grid" style="margin-top:14px;"></div>
+    </div>
+
+  </main>
+
+  <script>
+    const API = 'http://127.0.0.1:8000';
+    let pollInterval = null;
+    let currentVideoId = null;
+
+    // --- Health ---
+    async function checkHealth() {
+      try {
+        const r = await fetch(`${API}/health`);
+        const d = await r.json();
+        setPill('pill-redis', 'Redis', d.redis);
+        setPill('pill-db', 'DB', d.db);
+        document.getElementById('pill-actors').textContent = `${d.actors_loaded} Actors`;
+        document.getElementById('pill-actors').className = 'pill ok';
+      } catch {
+        ['pill-redis', 'pill-db', 'pill-actors'].forEach(id => {
+          const el = document.getElementById(id);
+          el.textContent = el.textContent.split(' ')[0] + ' ✗';
+          el.className = 'pill error';
+        });
+      }
+    }
+    function setPill(id, label, status) {
+      const el = document.getElementById(id);
+      el.textContent = status === 'ok' ? `${label} ✓` : `${label} ✗`;
+      el.className = 'pill ' + (status === 'ok' ? 'ok' : 'error');
+    }
+    checkHealth();
+
+    // --- Upload & Process ---
+    document.getElementById('btn-upload').addEventListener('click', async () => {
+      const fileInput = document.getElementById('video-file');
+      if (!fileInput.files.length) { alert('Please select a video file first.'); return; }
+
+      const file = fileInput.files[0];
+      if (file.size > 200 * 1024 * 1024) {
+        alert(`File is ${(file.size / 1024 / 1024).toFixed(0)} MB. Please use a video under 200 MB for testing.`);
+        return;
+      }
+
+      const btn = document.getElementById('btn-upload');
+      btn.disabled = true;
+      btn.textContent = 'Uploading...';
+
+      clearResults();
+      showProgress('Uploading video...', 5);
+
+      const form = new FormData();
+      form.append('file', file);
+
+      try {
+        const r = await fetch(`${API}/upload`, { method: 'POST', body: form });
+        if (!r.ok) { const e = await r.json(); throw new Error(e.detail); }
+        const d = await r.json();
+        currentVideoId = d.video_id;
+
+        const vidDisplay = document.getElementById('video-id-display');
+        vidDisplay.textContent = `video_id: ${d.video_id}  |  file: ${d.filename}  |  ${d.size_mb} MB`;
+        vidDisplay.classList.add('visible');
+
+        showProgress('Queued for processing...', 8);
+        btn.textContent = 'Processing...';
+
+        const r2 = await fetch(`${API}/process/${d.video_id}`, { method: 'POST' });
+        if (!r2.ok) { const e = await r2.json(); throw new Error(e.detail); }
+
+        startPolling(d.video_id);
+      } catch (err) {
+        alert('Error: ' + err.message);
+        btn.disabled = false;
+        btn.textContent = 'Upload & Start Processing';
+      }
+    });
+
+    function clearResults() {
+      document.getElementById('video-id-display').classList.remove('visible');
+      document.getElementById('progress-wrap').classList.remove('visible');
+      document.getElementById('timeline-box').classList.remove('visible');
+      if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+    }
+
+    function showProgress(step, pct) {
+      document.getElementById('progress-wrap').classList.add('visible');
+      document.getElementById('step-label').textContent = step;
+      document.getElementById('pct-label').textContent = pct + '%';
+      document.getElementById('progress-fill').style.width = pct + '%';
+    }
+
+    function startPolling(videoId) {
+      pollInterval = setInterval(async () => {
+
+        try {
+          const r = await fetch(`${API}/status/${videoId}`);
+          if (!r.ok) return;
+          const d = await r.json();
+          showProgress(d.current_step || d.status, d.progress_pct || 0);
+
+          if (d.status === 'done') {
+            clearInterval(pollInterval);
+            pollInterval = null;
+            loadResults(videoId);
+            document.getElementById('btn-upload').disabled = false;
+            document.getElementById('btn-upload').textContent = 'Upload & Start Processing';
+          } else if (d.status === 'error') {
+            clearInterval(pollInterval);
+            pollInterval = null;
+            showProgress('Error: ' + d.current_step, 0);
+            document.getElementById('btn-upload').disabled = false;
+            document.getElementById('btn-upload').textContent = 'Upload & Start Processing';
+          }
+        } catch { /* ignore */ }
+      }, 1000);
+    }
+
+    async function loadResults(videoId) {
+      try {
+        const r = await fetch(`${API}/metadata/${videoId}`);
+        if (!r.ok) return;
+        const data = await r.json();
+        renderTimeline(data);
+      } catch { /* ignore */ }
+    }
+
+    function renderTimeline(data) {
+      const box = document.getElementById('timeline-box');
+      const content = document.getElementById('timeline-content');
+
+      const meta = data.metadata || {};
+      let html = `<div style="font-size:12px;color:#888;margin-bottom:12px;">
+      Duration: ${(meta.duration_seconds || 0).toFixed(1)}s &nbsp;|&nbsp;
+      Frames: ${meta.frames_processed || 0} &nbsp;|&nbsp;
+      Processed in: ${(meta.processing_time_seconds || 0).toFixed(1)}s
+    </div>`;
+
+      const objSummary = data.objects_summary || {};
+      if (Object.keys(objSummary).length) {
+        const chips = Object.entries(objSummary).map(([k, v]) =>
+          `<span class="obj-chip">${k} ×${v}</span>`
+        ).join(' ');
+        html += `<div style="margin-bottom:14px;"><span style="font-size:11px;color:#666;margin-right:8px;">OBJECTS</span>${chips}</div>`;
+      }
+
+      const timeline = data.timeline || {};
+      for (const [sec, frame] of Object.entries(timeline)) {
+        const actors = frame.actors || [];
+        const objects = frame.objects || [];
+        if (!actors.length && !objects.length) continue;
+
+        const tc = formatTime(parseInt(sec));
+        const faces = actors.map(name =>
+          `<span class="face-chip">${name}</span>`
+        ).join('');
+        const objs = objects.map(label =>
+          `<span class="obj-chip">${label}</span>`
+        ).join('');
+
+        html += `<div class="timeline-item">
+        <div class="timecode">${tc}</div>
+        <div class="timeline-content">
+          ${faces ? `<div class="timeline-faces">${faces}</div>` : ''}
+          ${objs ? `<div class="timeline-objects">${objs}</div>` : ''}
+        </div>
+      </div>`;
+      }
+
+      content.innerHTML = html;
+      box.classList.add('visible');
+    }
+
+    function formatTime(s) {
+      const m = Math.floor(s / 60);
+      const sec = Math.floor(s % 60);
+      return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+    }
+
+    // --- Add Actor ---
+    document.getElementById('btn-add-actor').addEventListener('click', async () => {
+      const name = document.getElementById('actor-name').value.trim();
+      const photo = document.getElementById('actor-photo').files[0];
+      const msg = document.getElementById('actor-msg');
+
+      if (!name) { msg.textContent = 'Please enter a name.'; msg.className = 'msg error'; return; }
+      if (!photo) { msg.textContent = 'Please select a photo.'; msg.className = 'msg error'; return; }
+
+      msg.textContent = 'Uploading...'; msg.className = 'msg';
+
+      const form = new FormData();
+      form.append('name', name);
+      form.append('photo', photo);
+
+      try {
+        const r = await fetch(`${API}/actors/add`, { method: 'POST', body: form });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail);
+        msg.textContent = `✓ Actor "${d.actor_name}" added (id=${d.embedding_id})`;
+        msg.className = 'msg ok';
+        checkHealth();
+      } catch (err) {
+        msg.textContent = '✗ ' + err.message;
+        msg.className = 'msg error';
+      }
+    });
+
+    // --- Actors List ---
+    document.getElementById('btn-load-actors').addEventListener('click', async () => {
+      const grid = document.getElementById('actors-grid');
+      grid.innerHTML = '<span style="color:#888;font-size:13px;">Loading...</span>';
+      try {
+        const r = await fetch(`${API}/actors`);
+        const actors = await r.json();
+        grid.innerHTML = actors.map(a =>
+          `<span class="actor-chip">${a.name}</span>`
+        ).join('');
+      } catch {
+        grid.innerHTML = '<span style="color:#f44336;font-size:13px;">Failed to load actors.</span>';
+      }
+    });
+  </script>
+</body>
+
+</html>
