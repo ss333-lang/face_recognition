@@ -43,7 +43,56 @@ video-intel/
 
 ---
 
-## Quick Start
+## 🤖 AI Agent Execution Guide
+
+If you are an AI agent tasked with setting up and running this project automatically, execute these exact sequential steps using your command execution tools. This ensures background processes don't block your execution loop.
+
+### 1. Project Initialization
+```bash
+# Create virtual environment and install dependencies
+python3 -m venv venv
+source venv/bin/activate
+pip install -e ".[dev]"
+
+# Setup environment variables
+cp .env.example .env
+```
+
+### 2. Infrastructure (Redis & Database)
+Ensure Redis and PostgreSQL are running before starting the app.
+```bash
+# Start Redis in the background (Linux systemd)
+sudo systemctl start redis || sudo systemctl start redis-server || redis-server --daemonize yes
+
+# Start PostgreSQL and create the database (Linux systemd)
+sudo systemctl start postgresql
+sudo -u postgres psql -c "CREATE DATABASE videointel;" || psql -U postgres -c "CREATE DATABASE videointel;"
+```
+*(Note to Agent: The database requires the `pgvector` extension).*
+
+### 3. Start Application Services
+Run the services in the background using `nohup` so your execution tool does not hang.
+```bash
+source venv/bin/activate
+export PYTHONPATH=$PYTHONPATH:$(pwd)
+
+# Start Celery worker in background
+nohup celery -A src.video_intel.celery_worker worker --loglevel=info > celery.log 2>&1 &
+
+# Start FastAPI server in background
+nohup uvicorn src.video_intel.main:app --port 8000 > api.log 2>&1 &
+```
+
+### 4. Verify Health
+```bash
+# Wait for services to boot and verify
+sleep 5
+curl http://localhost:8000/health
+```
+
+---
+
+## 👨‍💻 Quick Start (Manual Setup)
 
 ### 1. Prerequisites
 
