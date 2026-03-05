@@ -130,6 +130,32 @@
       cursor: not-allowed;
     }
 
+    .results-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 14px;
+      padding: 10px 20px;
+      background: linear-gradient(135deg, #1a3a5c, #0a1f36);
+      color: #7ab8f5;
+      border: 1px solid #2a5a8c;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      transition: all 0.2s;
+    }
+
+    .results-btn:hover {
+      background: linear-gradient(135deg, #1e4a7a, #0e2a4a);
+      color: #aad4ff;
+      border-color: #4a8abf;
+    }
+
+    .results-btn.hidden {
+      display: none;
+    }
+
     button.secondary {
       background: #2a2a2a;
       color: #ccc;
@@ -266,6 +292,35 @@
       color: #f44336;
     }
 
+    .screentime-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 4px;
+    }
+
+    .screentime-card {
+      background: #111;
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      padding: 10px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 150px;
+    }
+
+    .screentime-name {
+      font-size: 13px;
+      color: #7ab8f5;
+      font-weight: 600;
+    }
+
+    .screentime-stats {
+      font-size: 11px;
+      color: #888;
+    }
+
     .row {
       display: flex;
       gap: 12px;
@@ -324,6 +379,8 @@
       <button id="btn-upload">Upload &amp; Start Processing</button>
 
       <div id="video-id-display"></div>
+      <a id="results-link" class="results-btn hidden" href="#" target="_blank">▶ &nbsp;View in Player (Netflix
+        X-Ray)</a>
 
       <div class="progress-wrap" id="progress-wrap">
         <div class="progress-label">
@@ -469,6 +526,7 @@
             loadResults(videoId);
             document.getElementById('btn-upload').disabled = false;
             document.getElementById('btn-upload').textContent = 'Upload & Start Processing';
+            showResultsBtn(videoId);
           } else if (d.status === 'error') {
             clearInterval(pollInterval);
             pollInterval = null;
@@ -515,12 +573,16 @@
         if (!actors.length && !objects.length) continue;
 
         const tc = formatTime(parseInt(sec));
-        const faces = actors.map(name =>
-          `<span class="face-chip">${name}</span>`
-        ).join('');
-        const objs = objects.map(label =>
-          `<span class="obj-chip">${label}</span>`
-        ).join('');
+        // actors is now a list of dicts: {actor, score, bbox, track_id}
+        const faces = actors.map(h => {
+          const name = (h && typeof h === 'object') ? (h.actor || 'Person') : h;
+          return `<span class="face-chip">${name}</span>`;
+        }).join('');
+        // objects is now a list of dicts: {label, confidence, bbox}
+        const objs = objects.map(o => {
+          const label = (o && typeof o === 'object') ? o.label : o;
+          return `<span class="obj-chip">${label}</span>`;
+        }).join('');
 
         html += `<div class="timeline-item">
         <div class="timecode">${tc}</div>
@@ -533,12 +595,37 @@
 
       content.innerHTML = html;
       box.classList.add('visible');
+
+      // Screentime summary
+      const screentime = data.screentime || {};
+      const names = Object.keys(screentime);
+      let stHtml = '';
+      if (names.length) {
+        stHtml = `<div style="margin-top:20px;">
+          <div style="font-size:11px;color:#666;margin-bottom:8px;letter-spacing:1px;">SCREENTIME</div>
+          <div class="screentime-grid">`;
+        for (const name of names) {
+          const s = screentime[name];
+          stHtml += `<div class="screentime-card">
+            <div class="screentime-name">${name}</div>
+            <div class="screentime-stats">Appeared ${s.scenes} time${s.scenes !== 1 ? 's' : ''} · ${s.seconds}s on screen</div>
+          </div>`;
+        }
+        stHtml += `</div></div>`;
+      }
+      content.innerHTML += stHtml;
     }
 
     function formatTime(s) {
       const m = Math.floor(s / 60);
       const sec = Math.floor(s % 60);
       return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+    }
+
+    function showResultsBtn(videoId) {
+      const link = document.getElementById('results-link');
+      link.href = `/results/${videoId}`;
+      link.classList.remove('hidden');
     }
 
     // --- Add Actor ---

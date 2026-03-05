@@ -19,7 +19,7 @@ import pytest
 
 from src.video_intel.pipeline import (
     ProcessingStatus,
-    _cosine_match,
+    cosine_match,
     detect_objects,
     extract_frames,
     run_pipeline,

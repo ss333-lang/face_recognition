@@ -24,7 +24,7 @@ FACE_THRESHOLD: float = float(
     os.getenv("FACE_THRESHOLD", "0.45")
 )
 FRAME_SAMPLE_INTERVAL: int = int(
-    os.getenv("FRAME_SAMPLE_INTERVAL", "2")
+    os.getenv("FRAME_SAMPLE_INTERVAL", "1")
 )
 YOLO_CONFIDENCE: float = float(
     os.getenv("YOLO_CONFIDENCE", "0.5")
@@ -127,16 +127,11 @@ def extract_frames(
             f"Cannot open video file: {video_path}"
         )
 
-    fps: float = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    total_frames: int = int(
-        cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    )
-    duration_seconds: float = (
-        total_frames / fps if fps > 0 else 0.0
-    )
-    frame_step: int = max(1, int(fps * interval))
+    raw_fps: float = cap.get(cv2.CAP_PROP_FPS) or 25.0
 
     frames: dict[int, Any] = {}
+    last_sampled_sec: int = -1
+    last_ms: float = 0.0
     frame_idx: int = 0
 
     try:
@@ -144,10 +139,16 @@ def extract_frames(
             ret, frame = cap.read()
             if not ret:
                 break
-            # Only keep frames that land on a sample boundary
-            if frame_idx % frame_step == 0:
-                timestamp_sec: int = int(frame_idx / fps)
-                frames[timestamp_sec] = frame
+            # Use the video's own position clock — immune to bad
+            # FPS metadata (e.g. WebM screencasts reporting 1000fps)
+            pos_ms: float = cap.get(cv2.CAP_PROP_POS_MSEC)
+            last_ms = pos_ms
+            pos_sec: int = int(pos_ms / 1000)
+
+            # Grab one frame per interval seconds of real video time
+            if pos_sec >= last_sampled_sec + interval:
+                frames[pos_sec] = frame
+                last_sampled_sec = pos_sec
             frame_idx += 1
     except Exception as exc:
         raise IOError(
@@ -157,9 +158,11 @@ def extract_frames(
     finally:
         cap.release()
 
+    duration_seconds: float = last_ms / 1000.0
+
     meta: dict[str, float] = {
         "duration_seconds": duration_seconds,
-        "fps": fps,
+        "fps": raw_fps,
         "frames_processed": float(len(frames)),
     }
     logger.info(
@@ -187,11 +190,15 @@ def detect_objects(
             threshold (0–1).
 
     Returns:
-        list[str]: Deduplicated list of detected object class
-            names that are in ``RELEVANT_OBJECTS``.
+        list[dict[str, Any]]: Deduplicated list of detected object dicts
+            with keys ``label``, ``confidence``, and ``bbox`` ([x, y, w, h]).
     """
     results = model(frame, verbose=False)
-    found: set[str] = set()
+    found_objs: list[dict[str, Any]] = []
+    # Deduplicate by keeping the highest confidence per class-box combo roughly
+    # But for bounding boxes, we actually want ALL distinct instances of an object
+    # (e.g. 3 different cars). 
+    
     for result in results:
         for box in result.boxes:
             score: float = float(box.conf[0])
@@ -202,8 +209,21 @@ def detect_objects(
                 result.names.get(class_idx, "")
             )
             if class_name in RELEVANT_OBJECTS:
-                found.add(class_name)
-    return list(found)
+                # box.xyxy[0] is [x1, y1, x2, y2]
+                x1, y1, x2, y2 = (
+                    float(box.xyxy[0][0]),
+                    float(box.xyxy[0][1]),
+                    float(box.xyxy[0][2]),
+                    float(box.xyxy[0][3]),
+                )
+                w = x2 - x1
+                h = y2 - y1
+                found_objs.append({
+                    "label": class_name,
+                    "confidence": round(score, 2),
+                    "bbox": [round(x1, 1), round(y1, 1), round(w, 1), round(h, 1)]
+                })
+    return found_objs
 
 
 def _cosine_match(
@@ -305,6 +325,12 @@ def track_and_match_faces(
         )
         embeddings.append(normed_emb)
 
+    # Build a {detection_index: embedding} lookup BEFORE calling
+    # DeepSORT, since DeepSORT may reorder tracks.
+    det_emb_map: dict[int, list[float]] = {}
+    for det_i, (det_bbox, _, _) in enumerate(detections):
+        det_emb_map[det_i] = embeddings[det_i]
+
     tracks = tracker.update_tracks(
         detections, frame=frame
     )
@@ -314,10 +340,10 @@ def track_and_match_faces(
         if not track.is_confirmed():
             continue
         track_id: int = int(track.track_id)
-        # Map back the embedding by detection insertion order
-        # DeepSORT does not expose matched embedding index,
-        # so we use the nearest unmatched embedding as proxy.
-        emb = embeddings[i] if i < len(embeddings) else None
+        # Use track index to map embedding (best-effort proxy)
+        emb = det_emb_map.get(i)
+        if emb is None and embeddings:
+            emb = embeddings[min(i, len(embeddings) - 1)]
         if emb is not None:
             actor_name, score = _cosine_match(
                 emb, actor_db, threshold
@@ -325,14 +351,45 @@ def track_and_match_faces(
         else:
             actor_name, score = None, 0.0
 
+        # get the bounding box from the deepsort track
+        # to_tlwh() returns [top_left_x, top_left_y, width, height]
+        track_bbox = track.to_tlwh()
+        x, y, w, h = (
+            float(track_bbox[0]),
+            float(track_bbox[1]),
+            float(track_bbox[2]),
+            float(track_bbox[3]),
+        )
+
         results.append(
             {
                 "track_id": track_id,
                 "actor": actor_name,
-                "score": score,
+                "score": round(score, 2),
+                "bbox": [round(x, 1), round(y, 1), round(w, 1), round(h, 1)],
             }
         )
-    return results
+    # Deduplicate: keep only the best-scoring match per actor.
+    # Without this, stale tracks all match the same face and
+    # the same actor appears multiple times in one frame.
+    best_per_actor: dict[str, tuple[int, float]] = {}
+    for r in results:
+        name = r["actor"]
+        if name is None:
+            continue
+        if name not in best_per_actor or r["score"] > best_per_actor[name][1]:
+            best_per_actor[name] = (r["track_id"], r["score"])
+
+    deduped: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for r in results:
+        name = r["actor"]
+        if name is None:
+            deduped.append(r)
+        elif name not in seen_names and best_per_actor.get(name, (None, 0))[0] == r["track_id"]:
+            deduped.append(r)
+            seen_names.add(name)
+    return deduped
 
 
 def run_pipeline(
@@ -413,8 +470,9 @@ def run_pipeline(
         "Detecting faces and objects...",
     )
 
-    # One DeepSORT tracker per pipeline call (never shared)
-    tracker = DeepSort(max_age=30)
+    # n_init=1: confirm immediately. max_age=3: kill stale tracks
+    # after 3 missed sampled frames (~6 real seconds), not 60.
+    tracker = DeepSort(max_age=3, n_init=1)
 
     timeline: dict[str, dict[str, Any]] = {}
     # actor_name → {seconds, scenes, first_seen}
@@ -458,9 +516,10 @@ def run_pipeline(
 
         for hit in face_hits:
             track_ids_in_frame.append(hit["track_id"])
+            actors_in_frame.append(hit)  # Store the full hit dict (actor, score, bbox)
+            
             if hit["actor"] is not None:
                 actor_name: str = hit["actor"]
-                actors_in_frame.append(actor_name)
                 if actor_name not in screentime:
                     screentime[actor_name] = {
                         "seconds": 0,
@@ -473,8 +532,9 @@ def run_pipeline(
                 screentime[actor_name]["scenes"] += 1
 
         for obj in obj_hits:
-            objects_summary[obj] = (
-                objects_summary.get(obj, 0) + 1
+            label = obj["label"]
+            objects_summary[label] = (
+                objects_summary.get(label, 0) + 1
             )
 
         timeline[str(ts)] = {

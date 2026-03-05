@@ -25,6 +25,7 @@ from fastapi import (
     HTTPException,
     UploadFile,
 )
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -133,7 +134,9 @@ async def startup_event() -> None:
     face_model = insightface.app.FaceAnalysis(
         allowed_modules=["detection", "recognition"]
     )
-    face_model.prepare(ctx_id=-1)
+    # det_thresh=0.25: lower than the 0.5 default so we catch
+    # faces in non-ideal angles (podcast close-ups, side views)
+    face_model.prepare(ctx_id=-1, det_thresh=0.25)
     logger.info("InsightFace model prepared (CPU).")
 
     actors = get_all_actors(db_conn)
@@ -464,9 +467,64 @@ async def health_check() -> dict[str, Any]:
     }
 
 
-# Static files mount MUST come after all route definitions
+# ---------------------------------------------------------------------------
+# Results page + utility routes
+# ---------------------------------------------------------------------------
+
+
+@app.get("/results/{video_id}")
+async def serve_results(video_id: str) -> FileResponse:
+    """Serve the Netflix X-Ray results page for a processed video.
+
+    Args:
+        video_id (str): The 8-character hex video identifier.
+
+    Returns:
+        FileResponse: The ``results.html`` single-page app.
+    """
+    return FileResponse("results.html")
+
+
+@app.get("/video-url/{video_id}")
+async def get_video_url(
+    video_id: str,
+) -> dict[str, Any]:
+    """Resolve the uploaded video filename so the frontend can load it.
+
+    Args:
+        video_id (str): The 8-character hex video identifier.
+
+    Returns:
+        dict[str, Any]: Dict with ``url`` (str) — the absolute URL
+            path the browser can use to load the video.
+
+    Raises:
+        HTTPException: 404 if no matching file is found.
+    """
+    matches = list(Path(UPLOAD_DIR).glob(f"{video_id}_*"))
+    if not matches:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No uploaded video found for video_id='{video_id}'.",
+        )
+    filename = matches[0].name
+    return {"url": f"/uploads/{filename}"}
+
+
+# --------- Frontend ---------
+
+@app.get("/")
+async def serve_frontend() -> FileResponse:
+    return FileResponse("index.html")
+
+# Static files — ALL mounts must come AFTER all route definitions
 app.mount(
     "/uploads",
     StaticFiles(directory=UPLOAD_DIR),
     name="uploads",
+)
+app.mount(
+    "/actor-photos",
+    StaticFiles(directory=ACTORS_DIR),
+    name="actor-photos",
 )

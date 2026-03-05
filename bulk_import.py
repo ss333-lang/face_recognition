@@ -42,7 +42,7 @@ DATABASE_URL: str = os.getenv(
 HF_DATASET: str = "tonyassi/celebrity-1000-embeddings"
 
 # How many photos to try per celebrity before giving up
-MAX_PHOTOS_TO_TRY: int = 5
+MAX_PHOTOS_TO_TRY: int = 50
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,6 +93,7 @@ def extract_embedding(
 def insert_actor_raw(
     name: str,
     embedding: list[float],
+    photo_path: str,
     conn: object,
 ) -> int:
     """Upsert one actor row into the actors table.
@@ -100,6 +101,8 @@ def insert_actor_raw(
     Args:
         name (str): Celebrity display name.
         embedding (list[float]): 512-d normed embedding.
+        photo_path (str): Path to the saved reference photo on disk,
+            or a placeholder string if no photo was saved.
         conn: Open psycopg2 connection.
 
     Returns:
@@ -119,7 +122,7 @@ def insert_actor_raw(
                     photo_path = EXCLUDED.photo_path
             RETURNING id;
             """,
-            (name, vec_str, HF_DATASET),
+            (name, vec_str, photo_path),
         )
         row = cur.fetchone()
     conn.commit()  # type: ignore[union-attr]
@@ -159,7 +162,7 @@ def main() -> None:
     face_model = insightface.app.FaceAnalysis(
         allowed_modules=["detection", "recognition"]
     )
-    face_model.prepare(ctx_id=-1)
+    face_model.prepare(ctx_id=-1, det_thresh=0.25)
     logger.info("InsightFace model ready (CPU mode).")
 
     # Connect to PostgreSQL
@@ -184,27 +187,60 @@ def main() -> None:
             skipped_no_face += 1
             continue
 
-        embedding: list[float] | None = None
+        # Collect ALL successful embeddings and average them.
+        # A mean-normalised embedding is measurably more robust than
+        # a single-photo embedding, especially for side-angle matches.
+        embeddings_collected: list[list[float]] = []
+        first_pil: object = None
+
         for idx in indices[:MAX_PHOTOS_TO_TRY]:
             pil_image = dataset[idx]["image"]
-            embedding = extract_embedding(pil_image, face_model)
-            if embedding is not None:
-                break
+            emb = extract_embedding(pil_image, face_model)
+            if emb is not None:
+                embeddings_collected.append(emb)
+                if first_pil is None:
+                    first_pil = pil_image  # keep for photo save
 
-        if embedding is None:
+        if not embeddings_collected:
             logger.warning(
                 "No face detected in any photo for '%s', skipping.", name
             )
             skipped_no_face += 1
             continue
 
+        # Average and re-normalise
+        mean_emb = np.mean(embeddings_collected, axis=0)
+        norm = float(np.linalg.norm(mean_emb))
+        if norm > 0:
+            mean_emb = mean_emb / norm
+        embedding: list[float] = mean_emb.tolist()
+
+        # Save the first good photo to actors/<name>.jpg
+        import os as _os
+        _os.makedirs("actors", exist_ok=True)
+        photo_path = f"actors/{name}.jpg"
+        if first_pil is not None:
+            try:
+                first_pil.save(photo_path, format="JPEG", quality=85)  # type: ignore[union-attr]
+            except Exception as _exc:
+                logger.warning(
+                    "Could not save photo for '%s': %s", name, _exc
+                )
+                photo_path = HF_DATASET  # fallback placeholder
+
         try:
             actor_id = insert_actor_raw(
                 name=name,
                 embedding=embedding,
+                photo_path=photo_path,
                 conn=conn,
             )
-            logger.info("✔ Inserted '%s' → id=%d", name, actor_id)
+            logger.info(
+                "✔ Inserted '%s' (avg of %d embeddings) → id=%d",
+                name,
+                len(embeddings_collected),
+                actor_id,
+            )
             inserted += 1
         except psycopg2.DatabaseError as exc:
             logger.error("DB error for '%s': %s", name, exc)
