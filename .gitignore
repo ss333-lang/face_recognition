@@ -6,8 +6,10 @@ uploads/
 processed/
 actors/
 
-# YOLO model weights (auto-downloaded)
+# YOLO model weights (auto-downloaded on first run)
 yolov8n.pt
+yolov8m.pt
+*.pt
 
 # Python cache
 __pycache__/

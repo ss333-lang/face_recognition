@@ -19,7 +19,7 @@ import pytest
 
 from src.video_intel.pipeline import (
     ProcessingStatus,
-    cosine_match,
+    _cosine_match,
     detect_objects,
     extract_frames,
     run_pipeline,
@@ -296,22 +296,25 @@ class TestDetectObjects:
         )
         frame = _make_black_frame()
         found = detect_objects(frame, model, confidence=0.5)
-        assert "person" in found
-        assert "car" in found
+        labels = [x["label"] for x in found]
+        assert "person" in labels
+        assert "car" in labels
 
     def test_irrelevant_objects_excluded(self) -> None:
         """Class names not in RELEVANT_OBJECTS must be filtered."""
         model = self._make_mock_yolo([(2, 0.9)])  # banana
         frame = _make_black_frame()
         found = detect_objects(frame, model, confidence=0.5)
-        assert "banana" not in found
+        labels = [x["label"] for x in found]
+        assert "banana" not in labels
 
     def test_low_confidence_excluded(self) -> None:
         """Detections below the confidence threshold are dropped."""
         model = self._make_mock_yolo([(0, 0.1)])  # person, low conf
         frame = _make_black_frame()
         found = detect_objects(frame, model, confidence=0.5)
-        assert "person" not in found
+        labels = [x["label"] for x in found]
+        assert "person" not in labels
 
     def test_empty_result_on_no_detections(self) -> None:
         """Empty detection list should return empty list."""
@@ -338,7 +341,7 @@ class TestTrackAndMatchFaces:
         frame = _make_black_frame()
 
         result = track_and_match_faces(
-            frame, tracker, face_model, actor_db, threshold=0.45
+            frame, tracker, face_model, actor_db, 0.45, {}, {}
         )
         assert result == []
 
@@ -358,6 +361,7 @@ class TestTrackAndMatchFaces:
         track = MagicMock()
         track.is_confirmed.return_value = True
         track.track_id = 42
+        track.to_tlwh.return_value = [10.0, 10.0, 40.0, 40.0]
         tracker = MagicMock()
         tracker.update_tracks.return_value = [track]
 
@@ -365,7 +369,7 @@ class TestTrackAndMatchFaces:
         frame = _make_black_frame()
 
         results = track_and_match_faces(
-            frame, tracker, face_model, actor_db, threshold=0.45
+            frame, tracker, face_model, actor_db, 0.45, {}, {}
         )
         assert len(results) == 1
         assert results[0]["track_id"] == 42
@@ -389,7 +393,7 @@ class TestTrackAndMatchFaces:
 
         frame = _make_black_frame()
         results = track_and_match_faces(
-            frame, tracker, face_model, {}, threshold=0.45
+            frame, tracker, face_model, {}, 0.45, {}, {}
         )
         assert results == []
 

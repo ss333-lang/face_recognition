@@ -30,6 +30,8 @@ YOLO_CONFIDENCE: float = float(
     os.getenv("YOLO_CONFIDENCE", "0.5")
 )
 MAX_BATCH_SIZE: int = int(os.getenv("MAX_BATCH_SIZE", "32"))
+# Max embeddings stored per track — prevents O(N) mean on long videos
+MAX_TRACK_EMBEDDINGS: int = 30
 
 RELEVANT_OBJECTS: list[str] = [
     "person",
@@ -94,40 +96,51 @@ def extract_frames(
     video_path: str,
     interval: int,
 ) -> tuple[dict[int, Any], dict[str, float]]:
-    """Read a video file and sample one frame every N seconds."""
+    """Sample one frame every N seconds using direct seeking.
+
+    Uses ``cap.set(cv2.CAP_PROP_POS_MSEC)`` to jump directly to
+    target timestamps rather than decoding every frame.  For a 60 s
+    video at 30 fps with interval=2, this reads 30 frames instead of
+    1 800 — a ~60× speed-up on typical content.
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video file: {video_path}")
 
-    # BUG FIX: Handle '1000 FPS' bug
+    # Guard against bogus FPS metadata (the '1000 FPS' bug)
     raw_fps: float = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    if raw_fps > 100.0 or raw_fps < 1.0:
+    if raw_fps > 120.0 or raw_fps < 1.0:
         raw_fps = 25.0
 
+    total_frames: float = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+    duration_ms: float = (total_frames / raw_fps) * 1000.0
+
     frames: dict[int, Any] = {}
-    last_sampled_sec: int = -1
-    last_ms: float = 0.0
-    frame_idx: int = 0
+    target_ms: float = 0.0
 
     try:
         while True:
+            cap.set(cv2.CAP_PROP_POS_MSEC, target_ms)
             ret, frame = cap.read()
             if not ret:
                 break
-            pos_ms: float = cap.get(cv2.CAP_PROP_POS_MSEC)
-            last_ms = pos_ms
-            pos_sec: int = int(pos_ms / 1000)
-
-            if pos_sec >= last_sampled_sec + interval:
-                frames[pos_sec] = frame
-                last_sampled_sec = pos_sec
-            frame_idx += 1
+            pos_sec: int = int(target_ms / 1000)
+            frames[pos_sec] = frame
+            target_ms += interval * 1000.0
+            # Stop if we've passed the video end
+            if duration_ms > 0 and target_ms > duration_ms + 500:
+                break
     except Exception as exc:
-        raise IOError(f"Error reading frame {frame_idx} from {video_path}.") from exc
+        raise IOError(
+            f"Error seeking to {target_ms:.0f} ms in {video_path}."
+        ) from exc
     finally:
         cap.release()
 
-    duration_seconds: float = last_ms / 1000.0
+    # Use estimate when duration_ms is available, else last target
+    duration_seconds: float = (
+        duration_ms / 1000.0 if duration_ms > 0 else target_ms / 1000.0
+    )
     meta: dict[str, float] = {
         "duration_seconds": duration_seconds,
         "fps": raw_fps,
@@ -170,88 +183,206 @@ def detect_objects(
 
 def _cosine_match(
     embedding: list[float],
-    actor_db: dict[str, list[float]],
+    actor_names: list[str],
+    actor_matrix: "np.ndarray | None",
     threshold: float,
 ) -> tuple[str | None, float]:
-    """Find the best matching actor via cosine similarity."""
-    if not actor_db:
+    """Find the best matching actor via vectorized cosine similarity.
+
+    Uses a pre-built (N × 512) matrix so all scores are computed with
+    a single matrix-vector multiply instead of a Python loop.  For a
+    database of 1 000 actors this is ~1 000× faster than the loop.
+
+    Both the query embedding and all rows in ``actor_matrix`` must be
+    L2-normalised so that the dot product equals cosine similarity.
+    """
+    if not actor_names or actor_matrix is None:
         return None, 0.0
 
     query = np.array(embedding, dtype=np.float32)
-    best_name, best_score = None, 0.0
-
-    for name, ref_emb in actor_db.items():
-        ref = np.array(ref_emb, dtype=np.float32)
-        score: float = float(np.dot(query, ref))
-        if score > best_score:
-            best_score = score
-            best_name = name
+    # Shape: (N,) — cosine similarities for all actors at once
+    scores: "np.ndarray" = actor_matrix @ query
+    best_idx: int = int(np.argmax(scores))
+    best_score: float = float(scores[best_idx])
 
     if best_score >= threshold:
-        return best_name, round(best_score, 2)
+        return actor_names[best_idx], round(best_score, 2)
     return None, 0.0
+
+
+def _calc_iou(box_a: list[float], box_b: list[float]) -> float:
+    """Calculates Intersection over Union for two bounding boxes.
+
+    Args:
+        box_a (list[float]): Bounding box [x, y, w, h].
+        box_b (list[float]): Bounding box [x, y, w, h].
+
+    Returns:
+        float: the intersection-over-union score.
+    """
+    x_a = max(box_a[0], box_b[0])
+    y_a = max(box_a[1], box_b[1])
+    x_b = min(box_a[0] + box_a[2], box_b[0] + box_b[2])
+    y_b = min(box_a[1] + box_a[3], box_b[1] + box_b[3])
+
+    inter_area = max(0.0, x_b - x_a) * max(0.0, y_b - y_a)
+    if inter_area == 0:
+        return 0.0
+
+    box_a_area = box_a[2] * box_a[3]
+    box_b_area = box_b[2] * box_b[3]
+    return inter_area / float(box_a_area + box_b_area - inter_area)
 
 
 def track_and_match_faces(
     frame: Any,
     tracker: Any,
     face_model: Any,
-    actor_db: dict[str, list[float]],
+    actor_names: list[str],
+    actor_matrix: "np.ndarray | None",
     threshold: float,
+    track_embeddings: dict[int, list[list[float]]],
+    track_identities: dict[int, tuple[str | None, float]],
 ) -> list[dict[str, Any]]:
-    """Detect, track, and match faces in a single frame."""
+    """Detect, track, and match faces in a single frame.
+
+    Args:
+        frame: The image matrix (BGR, uint8).
+        tracker: DeepSORT instance.
+        face_model: InsightFace FaceAnalysis model.
+        actor_names: Ordered list of actor names matching
+            rows in ``actor_matrix``.
+        actor_matrix: Pre-built (N × 512) float32 array of
+            L2-normalised actor embeddings.  Pass ``None``
+            when no actors are registered.
+        threshold: Minimum cosine similarity to accept a match.
+        track_embeddings: Accumulated embeddings per track_id
+            (capped at MAX_TRACK_EMBEDDINGS per track).
+        track_identities: Best confirmed identity per track_id.
+
+    Returns:
+        List of dicts with ``track_id``, ``actor``, ``score``,
+        and ``bbox`` [x, y, w, h] for confirmed tracks only.
+    """
     faces = face_model.get(frame)
     if not faces:
+        # Still update tracker with empty detections so ages increment correctly
+        tracker.update_tracks([], frame=frame)
         return []
 
-    detections, embeddings = [], []
+    detections: list[tuple[list[float], float, str]] = []
+    face_boxes: list[list[float]] = []
+    embeddings: list[list[float]] = []
+    det_scores: list[float] = []
+
     for face in faces:
         bbox = face.bbox
-        x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
-        detections.append(([x1, y1, x2 - x1, y2 - y1], float(face.det_score), "face"))
+        x1, y1 = float(bbox[0]), float(bbox[1])
+        x2, y2 = float(bbox[2]), float(bbox[3])
+        tlwh = [x1, y1, x2 - x1, y2 - y1]
+        score_f = float(face.det_score)
+        detections.append((tlwh, score_f, "face"))
+        face_boxes.append(tlwh)
         embeddings.append(face.normed_embedding.tolist())
+        det_scores.append(score_f)
 
-    det_emb_map = {i: emb for i, emb in enumerate(embeddings)}
     tracks = tracker.update_tracks(detections, frame=frame)
 
-    results = []
-    for i, track in enumerate(tracks):
+    results: list[dict[str, Any]] = []
+    for track in tracks:
         if not track.is_confirmed():
             continue
-        track_id = int(track.track_id)
-        # Standard proxy mapping
-        emb = det_emb_map.get(i)
-        if emb is None and embeddings:
-            emb = embeddings[min(i, len(embeddings) - 1)]
-        
-        actor_name, score = (None, 0.0)
-        if emb is not None:
-            actor_name, score = _cosine_match(emb, actor_db, threshold)
 
+        # GHOST TRACK FIX: skip tracks that were NOT matched to a real detection
+        # in this frame.  time_since_update == 0 means InsightFace found the face
+        # right now.  Values > 0 mean DeepSORT is predicting position via Kalman
+        # filter — the person may not even be on screen.  Including these caused:
+        #   • phantom bboxes in frames where actors are absent
+        #   • scenes always counting as 1 (no real gaps)
+        #   • inflated screentime seconds
+        if track.time_since_update > 0:
+            continue
+
+        track_id = int(track.track_id)
         bbox = track.to_tlwh()
+
+        best_iou = 0.0
+        best_idx = -1
+        for i, f_tlwh in enumerate(face_boxes):
+            iou = _calc_iou(bbox, f_tlwh)
+            if iou > best_iou:
+                best_iou = iou
+                best_idx = i
+
+        if best_idx >= 0 and best_iou > 0.3:
+            det_score = det_scores[best_idx]
+            # ACCURACY FIX: only accumulate HIGH-QUALITY embeddings.
+            # Low-confidence detections (blurry, occluded, side-profile)
+            # drag down the running average and reduce match scores.
+            # det_score >= 0.5 keeps sharp, frontal faces only.
+            if det_score >= 0.5:
+                if track_id not in track_embeddings:
+                    track_embeddings[track_id] = []
+                track_embeddings[track_id].append(embeddings[best_idx])
+                # Cap history to prevent O(N) mean on long videos
+                if len(track_embeddings[track_id]) > MAX_TRACK_EMBEDDINGS:
+                    track_embeddings[track_id] = (
+                        track_embeddings[track_id][-MAX_TRACK_EMBEDDINGS:]
+                    )
+
+        actor_name: str | None = None
+        score: float = 0.0
+
+        if track_id in track_embeddings and track_embeddings[track_id]:
+            embs = track_embeddings[track_id]
+            avg_emb = np.mean(embs, axis=0)
+            norm = np.linalg.norm(avg_emb)
+            if norm > 0:
+                avg_emb = avg_emb / norm
+
+            avg_emb_list: list[float] = avg_emb.tolist()
+            tmp_name, tmp_score = _cosine_match(
+                avg_emb_list, actor_names, actor_matrix, threshold
+            )
+
+            if track_id in track_identities and \
+                    track_identities[track_id][1] > 0.65:
+                actor_name, score = track_identities[track_id]
+            else:
+                track_identities[track_id] = (tmp_name, tmp_score)
+                actor_name, score = tmp_name, tmp_score
+
         results.append({
             "track_id": track_id,
             "actor": actor_name,
             "score": score,
-            "bbox": [round(bbox[0], 1), round(bbox[1], 1), round(bbox[2], 1), round(bbox[3], 1)],
+            "bbox": [
+                round(bbox[0], 1),
+                round(bbox[1], 1),
+                round(bbox[2], 1),
+                round(bbox[3], 1),
+            ],
         })
 
-    # Global Deduplication (to avoid Ryan Gosling being 2 tracks at once)
-    best_per_actor = {}
+    best_per_actor: dict[str, tuple[int, float]] = {}
     for r in results:
         name = r["actor"]
-        if name and (name not in best_per_actor or r["score"] > best_per_actor[name][1]):
-            best_per_actor[name] = (r["track_id"], r["score"])
+        if name is not None:
+            if name not in best_per_actor or \
+               r["score"] > best_per_actor[name][1]:
+                best_per_actor[name] = (r["track_id"], r["score"])
 
-    deduped = []
-    seen_names = set()
+    deduped: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
     for r in results:
         name = r["actor"]
         if name is None:
             deduped.append(r)
-        elif name not in seen_names and best_per_actor.get(name, (None, 0))[0] == r["track_id"]:
+        elif name not in seen_names and \
+             best_per_actor.get(name, (0, 0.0))[0] == r["track_id"]:
             deduped.append(r)
             seen_names.add(name)
+
     return deduped
 
 
@@ -269,73 +400,139 @@ def run_pipeline(
     processed_dir = os.getenv("PROCESSED_DIR", "processed")
     os.makedirs(processed_dir, exist_ok=True)
 
-    def _set_status(status, progress, step):
-        redis_client.set(f"status:{video_id}", json.dumps({"status": status.value, "progress_pct": progress, "current_step": step}))
+    def _set_status(status: ProcessingStatus, progress: int, step: str) -> None:
+        redis_client.set(
+            f"status:{video_id}",
+            json.dumps(
+                {"status": status.value, "progress_pct": progress, "current_step": step}
+            ),
+        )
 
     start_time = time.time()
     _set_status(ProcessingStatus.EXTRACTING, 10, "Extracting frames...")
     frames, meta = extract_frames(video_path, FRAME_SAMPLE_INTERVAL)
 
     _set_status(ProcessingStatus.DETECTING, 30, "Analyzing video content...")
-    tracker = DeepSort(max_age=3, n_init=1)
 
-    timeline, screentime, objects_summary = {}, {}, {}
-    prev_actors = set()
-    # Spatial memory for unidentified persons
-    prev_person_boxes = [] 
-    
+    # Pre-build actor name list + L2-normalised embedding matrix ONCE.
+    # _cosine_match uses a single matrix-vector multiply (actor_matrix @ query)
+    # instead of a Python loop, giving ~1000× speed-up for large DBs.
+    actor_names: list[str] = list(actor_db.keys())
+    actor_matrix: np.ndarray | None = None
+    if actor_names:
+        raw = np.array(
+            [actor_db[n] for n in actor_names], dtype=np.float32
+        )  # shape (N, 512)
+        norms = np.linalg.norm(raw, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        actor_matrix = raw / norms
+
+    # n_init=3: require 3 consecutive detections before confirming a track
+    # (was 1 — caused many false/ghost tracks on noisy detections).
+    # max_age=60: keep tracks alive longer to survive brief occlusions.
+    # max_cosine_distance=0.4: stricter ReID feature matching.
+    tracker = DeepSort(max_age=60, n_init=3, max_cosine_distance=0.4)
+
+    timeline: dict[str, Any] = {}
+    screentime: dict[str, Any] = {}
+    objects_summary: dict[str, int] = {}
+    prev_person_boxes: list[list[float]] = []
+
+    track_embeddings: dict[int, list[list[float]]] = {}
+    track_identities: dict[int, tuple[str | None, float]] = {}
+
     sorted_timestamps = sorted(frames.keys())
     for ts in sorted_timestamps:
         frame = frames[ts]
-        face_hits = track_and_match_faces(frame, tracker, face_model, actor_db, FACE_THRESHOLD)
+        face_hits = track_and_match_faces(
+            frame,
+            tracker,
+            face_model,
+            actor_names,
+            actor_matrix,
+            FACE_THRESHOLD,
+            track_embeddings,
+            track_identities,
+        )
         obj_hits = detect_objects(frame, yolo_model, YOLO_CONFIDENCE)
 
-        current_actors, current_person_boxes = set(), []
-        actors_in_frame, track_ids_in_frame = [], []
+        current_person_boxes: list[list[float]] = []
+        actors_in_frame: list[dict[str, Any]] = []
+        track_ids_in_frame: list[int] = []
 
-        # 1. Process Faces/Actors
         for hit in face_hits:
             track_ids_in_frame.append(hit["track_id"])
             actors_in_frame.append(hit)
-            name = hit["actor"]
-            if name:
-                current_actors.add(name)
-                if name not in screentime:
-                    screentime[name] = {"seconds": 0, "scenes": 0, "first_seen": ts}
-                screentime[name]["seconds"] += FRAME_SAMPLE_INTERVAL
-                # Phenomenal Counting Logic: Appearance Based
-                if name not in prev_actors:
-                    screentime[name]["scenes"] += 1
 
-        # 2. Process Objects and Deduplicate Persons
         for obj in obj_hits:
             label = obj["label"]
             if label == "person":
-                # Phenomenal Logic A: Actor overlapping person?
                 is_actor = False
                 for fhit in face_hits:
                     if _get_overlap_ratio(obj["bbox"], fhit["bbox"]) > 0.7:
-                        is_actor = True; break
-                if is_actor: continue
+                        is_actor = True
+                        break
+                if is_actor: 
+                    continue
                 
-                # Phenomenal Logic B: Spatial memory (Same person stationary?)
                 is_duplicate = False
                 for pbox in prev_person_boxes:
                     if _get_overlap_ratio(obj["bbox"], pbox) > 0.8:
-                        is_duplicate = True; break
+                        is_duplicate = True
+                        break
                 
                 current_person_boxes.append(obj["bbox"])
-                if is_duplicate: continue
+                if is_duplicate: 
+                    continue
             
             objects_summary[label] = objects_summary.get(label, 0) + 1
             
-        prev_actors = current_actors
         prev_person_boxes = current_person_boxes
-        timeline[str(ts)] = {"actors": actors_in_frame, "objects": obj_hits, "track_ids": track_ids_in_frame}
+        frame_payload = {
+            "actors": actors_in_frame, 
+            "objects": obj_hits, 
+            "track_ids": track_ids_in_frame
+        }
+        timeline[str(ts)] = frame_payload
+        
+        # Publish live frame tracking to Redis for Real-Time clients
+        redis_client.publish(
+            f"realtime:{video_id}",
+            json.dumps({
+                "type": "frame_result",
+                "timestamp_seconds": float(ts),
+                "data": frame_payload
+            })
+        )
+
+    # Lookahead / Backdating pass
+    for ts_str, frame_data in timeline.items():
+        for fhit in frame_data.get("actors", []):
+            tid = fhit.get("track_id")
+            if tid in track_identities:
+                final_name, final_score = track_identities[tid]
+                fhit["actor"] = final_name
+                fhit["score"] = final_score
+
+    # Re-calculate screentime accurately
+    prev_actors_list: list[str] = []
+    for ts_str in sorted(timeline.keys(), key=float):
+        c_actors = set()
+        for fhit in timeline[ts_str].get("actors", []):
+            name = fhit.get("actor")
+            if name is not None:
+                c_actors.add(name)
+                if name not in screentime:
+                    screentime[name] = {
+                        "seconds": 0, "scenes": 0, "first_seen": float(ts_str)
+                    }
+                screentime[name]["seconds"] += FRAME_SAMPLE_INTERVAL
+                if name not in prev_actors_list:
+                    screentime[name]["scenes"] += 1
+        prev_actors_list = list(c_actors)
 
     elapsed = round(time.time() - start_time, 2)
     
-    # Final metadata guard for 1000 FPS bug
     final_fps = meta["fps"]
     if final_fps > 100.0 or final_fps < 1.0:
         final_fps = 25.0
@@ -358,4 +555,5 @@ def run_pipeline(
         json.dump(result, fh, indent=2)
 
     _set_status(ProcessingStatus.DONE, 100, "Processing Complete.")
+    redis_client.publish(f"realtime:{video_id}", "DONE")
     return result

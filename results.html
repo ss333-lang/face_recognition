@@ -438,6 +438,36 @@
             gap: 5px;
             flex: 1;
         }
+
+        /* Live inference toggle */
+        .live-btn {
+            margin-left: auto;
+            padding: 4px 14px;
+            border-radius: 20px;
+            border: 1px solid #333;
+            background: #1a1a1a;
+            color: #888;
+            cursor: pointer;
+            font-size: 11px;
+            font-family: inherit;
+            transition: all 0.15s;
+        }
+
+        .live-btn:hover:not(:disabled) {
+            border-color: #e50914;
+            color: #e0e0e0;
+        }
+
+        .live-btn:disabled {
+            opacity: 0.5;
+            cursor: default;
+        }
+
+        .live-btn.live-active {
+            background: #3a0a0a;
+            border-color: #e50914;
+            color: #ff5252;
+        }
     </style>
 </head>
 
@@ -488,6 +518,7 @@
         <span class="legend-item">
             <span class="leg-dot" style="border-color:#ce93d8;"></span> YOLO Object
         </span>
+        <button id="live-infer-btn" class="live-btn" onclick="toggleLiveInference()">⚡ Live Inference</button>
     </div>
 
     <!-- Results content -->
@@ -526,6 +557,12 @@
         let tlData = null;
         let timestamps = [];
         let prevActorNames = new Set();
+
+        // ── Live inference state ─────────────────────────────────
+        let liveInferMode = false;
+        let inferWs = null;
+        let inferBusy = false;
+        let captureCanvas = null;
 
         const video = document.getElementById('player');
         const canvas = document.getElementById('overlay');
@@ -583,7 +620,11 @@
 
                 // 2. Load pipeline results
                 const mr = await fetch(`${API}/metadata/${videoId}`);
-                if (!mr.ok) throw new Error(`Results not ready (${mr.status}). Has the video finished processing?`);
+                if (!mr.ok) {
+                    console.log("Results not ready, starting live stream.");
+                    startLiveStream();
+                    return;
+                }
                 tlData = await mr.json();
 
                 // Build sorted timestamp index
@@ -609,12 +650,44 @@
             }
         }
 
+        let ws = null;
+        function startLiveStream() {
+            tlData = { timeline: {}, objects_summary: {}, screentime: {}, metadata: {} };
+            timestamps = [];
+
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('player-section').classList.remove('hidden');
+            document.getElementById('legend').style.display = 'flex';
+            document.getElementById('results-section').classList.remove('hidden');
+
+            // Show a live badge
+            const badge = document.getElementById('vid-badge');
+            badge.innerHTML = `video_id: ${videoId} <span style="color:#00e5ff;margin-left:10px;">🔴 LIVE PROCESSING</span>`;
+
+            ws = new WebSocket(`ws://127.0.0.1:8000/ws/realtime/${videoId}`);
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                if (msg.type === "DONE") {
+                    badge.innerHTML = `video_id: ${videoId} <span style="color:#00e5ff;margin-left:10px;">✅ DONE</span>`;
+                    ws.close();
+                    return;
+                }
+                if (msg.type === "frame_result") {
+                    const ts = msg.timestamp_seconds;
+                    tlData.timeline[ts] = msg.data;
+                    timestamps.push(ts);
+                    timestamps.sort((a, b) => a - b);
+                }
+            };
+            ws.onerror = (error) => {
+                console.error("Live processing error:", error);
+            };
+        }
+
         init();
 
         // ── Canvas resize ────────────────────────────────────
         video.addEventListener('loadedmetadata', () => {
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
             syncCanvasSize();
         });
 
@@ -624,16 +697,44 @@
         });
 
         function syncCanvasSize() {
-            // Match CSS pixel size of the letterboxed video inside .video-container
+            if (!video.videoWidth || !video.videoHeight) return;
+
+            // Set canvas INTERNAL resolution to match video — so bbox coordinates
+            // (which are in original video pixel space) map 1:1 onto canvas pixels.
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+
+            // Now set the CSS display size to match the ACTUAL rendered video
+            // area inside the element.  With object-fit:contain the browser
+            // adds letterbox/pillarbox bars; getBoundingClientRect() returns
+            // the full element size including those bars, so we must compute
+            // the content area ourselves to avoid stretching the overlay.
             const vRect = video.getBoundingClientRect();
-            canvas.style.width = vRect.width + 'px';
-            canvas.style.height = vRect.height + 'px';
+            const elemW = vRect.width;
+            const elemH = vRect.height;
+            const vidAspect = video.videoWidth / video.videoHeight;
+            const elemAspect = elemW / elemH;
+
+            let renderW, renderH;
+            if (vidAspect > elemAspect) {
+                // Video wider than container — black bars top/bottom
+                renderW = elemW;
+                renderH = elemW / vidAspect;
+            } else {
+                // Video taller than container — black bars left/right
+                renderH = elemH;
+                renderW = elemH * vidAspect;
+            }
+
+            canvas.style.width = renderW + 'px';
+            canvas.style.height = renderH + 'px';
         }
 
         window.addEventListener('resize', syncCanvasSize);
 
         // ── Render loop ──────────────────────────────────────
         video.addEventListener('timeupdate', () => {
+            if (liveInferMode) return; // live mode drives its own drawing
             const frame = frameAt(video.currentTime);
             drawFrame(frame);
             updateActorPanel(frame);
@@ -689,16 +790,16 @@
             ctx.font = '700 12px Inter, system-ui, sans-serif';
             const textMetrics = ctx.measureText(label);
             const textWidth = textMetrics.width;
-            const textHeight = 14; 
+            const textHeight = 14;
             const paddingX = 8;
             const paddingY = 6;
-            
+
             const pillWidth = textWidth + (paddingX * 2);
             const pillHeight = textHeight + (paddingY * 2);
-            
+
             let pillX = x;
             let pillY = y - pillHeight - 2;
-            
+
             // Flip if off-screen top
             if (pillY < 0) pillY = y + h + 2;
 
@@ -735,7 +836,6 @@
           <img
             src="/actor-photos/${encodeURIComponent(h.actor)}.jpg"
             alt="${h.actor}"
-            onerror="this.style.display='none'"
           />
           <div class="actor-info">
             <div class="actor-name">${h.actor}</div>
@@ -821,7 +921,8 @@
                 }).join('');
                 const oChips = objects.map(o => {
                     const label = (o && typeof o === 'object') ? o.label : o;
-                    return `<span class="obj-chip">${label}<n>`           }).join('');
+                    return `<span class="obj-chip">${label}</span>`;
+                }).join('');
 
                 html += `
           <div class="tl-item">
@@ -836,6 +937,121 @@
             const m = Math.floor(s / 60);
             const r = Math.floor(s % 60);
             return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`;
+        }
+
+        // ── Live Inference ───────────────────────────────────────
+        function toggleLiveInference() {
+            if (liveInferMode) {
+                stopLiveInference();
+            } else {
+                startLiveInference();
+            }
+        }
+
+        function startLiveInference() {
+            if (inferWs) { inferWs.close(); inferWs = null; }
+
+            const btn = document.getElementById('live-infer-btn');
+            btn.textContent = '⏳ Connecting…';
+            btn.disabled = true;
+
+            inferWs = new WebSocket(`ws://127.0.0.1:8000/ws/infer`);
+            inferWs.binaryType = 'arraybuffer';
+
+            inferWs.onopen = () => {
+                liveInferMode = true;
+                inferBusy = false;
+                captureCanvas = document.createElement('canvas');
+                captureCanvas.width = video.videoWidth || 640;
+                captureCanvas.height = video.videoHeight || 360;
+                btn.textContent = '🔴 Live ON';
+                btn.disabled = false;
+                btn.classList.add('live-active');
+                requestAnimationFrame(captureAndSend);
+            };
+
+            inferWs.onmessage = (event) => {
+                try {
+                    const detections = JSON.parse(event.data);
+                    drawLiveFrame(detections);
+                } catch (_) {}
+                inferBusy = false;
+            };
+
+            inferWs.onerror = () => stopLiveInference();
+            inferWs.onclose = () => { if (liveInferMode) stopLiveInference(); };
+        }
+
+        function stopLiveInference() {
+            liveInferMode = false;
+            if (inferWs) { inferWs.close(); inferWs = null; }
+            inferBusy = false;
+            captureCanvas = null;
+            const btn = document.getElementById('live-infer-btn');
+            btn.textContent = '⚡ Live Inference';
+            btn.disabled = false;
+            btn.classList.remove('live-active');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+
+        function captureAndSend() {
+            if (!liveInferMode) return;
+
+            if (
+                !inferBusy &&
+                inferWs && inferWs.readyState === WebSocket.OPEN &&
+                !video.paused && !video.ended &&
+                video.videoWidth > 0
+            ) {
+                // Keep capture canvas in sync with video dimensions
+                if (captureCanvas.width !== video.videoWidth ||
+                    captureCanvas.height !== video.videoHeight) {
+                    captureCanvas.width = video.videoWidth;
+                    captureCanvas.height = video.videoHeight;
+                }
+                captureCanvas.getContext('2d').drawImage(video, 0, 0);
+                inferBusy = true;
+                captureCanvas.toBlob((blob) => {
+                    if (!blob || !inferWs || inferWs.readyState !== WebSocket.OPEN) {
+                        inferBusy = false;
+                        return;
+                    }
+                    blob.arrayBuffer().then(buf => {
+                        if (inferWs && inferWs.readyState === WebSocket.OPEN) {
+                            inferWs.send(buf);
+                        } else {
+                            inferBusy = false;
+                        }
+                    }).catch(() => { inferBusy = false; });
+                }, 'image/jpeg', 0.8);
+            }
+
+            requestAnimationFrame(captureAndSend);
+        }
+
+        function drawLiveFrame(detections) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            for (const face of (detections.faces || [])) {
+                if (!face.bbox) continue;
+                const color = face.actor ? '#00e5ff' : '#ffd600';
+                const label = face.actor
+                    ? `${face.actor}  ${Math.round(face.score * 100)}%`
+                    : 'Person';
+                drawBox(...face.bbox, color, label);
+            }
+
+            for (const obj of (detections.objects || [])) {
+                if (!obj.bbox) continue;
+                drawBox(...obj.bbox, '#ce93d8',
+                    `${obj.label}  ${Math.round((obj.confidence || 0) * 100)}%`);
+            }
+
+            // Mirror actor panel with live results
+            const recognised = (detections.faces || []).filter(f => f.actor != null);
+            updateActorPanel({
+                actors: recognised.map(f => ({ actor: f.actor, score: f.score }))
+            });
         }
     </script>
 </body>

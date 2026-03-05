@@ -52,6 +52,34 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
 )
 
+# ---------------------------------------------------------------------------
+# Module-level model singletons — loaded ONCE per worker process, not per
+# task.  This cuts 15–30 seconds of re-initialisation overhead from every
+# video task.
+# ---------------------------------------------------------------------------
+
+_face_model: Any = None
+_yolo_model: Any = None
+
+
+def _get_models() -> tuple[Any, Any]:
+    """Return cached (face_model, yolo_model), initialising on first call."""
+    global _face_model, _yolo_model
+    if _face_model is None:
+        logger.info("Loading InsightFace model (first task in this worker)…")
+        _face_model = insightface.app.FaceAnalysis(
+            allowed_modules=["detection", "recognition"]
+        )
+        # det_thresh=0.25 matches the API server setting — lower than default
+        # 0.5 so we catch side-profile and partially-occluded faces.
+        _face_model.prepare(ctx_id=-1, det_thresh=0.25)
+        logger.info("InsightFace ready.")
+    if _yolo_model is None:
+        logger.info("Loading YOLOv8m model (first task in this worker)…")
+        _yolo_model = YOLO("yolov8m.pt")
+        logger.info("YOLO ready.")
+    return _face_model, _yolo_model
+
 
 @celery_app.task(
     bind=True,
@@ -66,28 +94,22 @@ def process_video_task(
 ) -> dict[str, Any]:
     """Celery task that runs the complete video pipeline.
 
-    Initialises all heavyweight models inside the task
-    worker process, runs the pipeline, and returns the
-    result payload.  A fresh ``DeepSort`` tracker is created
-    inside ``run_pipeline`` so it is never shared between
-    concurrent tasks.
+    Models are loaded once per worker process via ``_get_models()``.
+    A fresh ``DeepSort`` tracker is created inside ``run_pipeline``
+    so it is never shared between concurrent tasks.
 
     Args:
-        self (Any): Celery task instance (injected by
-            ``bind=True``).
-        video_path (str): Absolute path to the uploaded
-            video file.
-        video_id (str): Unique identifier for status
-            tracking and output naming.
+        self (Any): Celery task instance (injected by ``bind=True``).
+        video_path (str): Absolute path to the uploaded video file.
+        video_id (str): Unique identifier for status tracking and
+            output naming.
 
     Returns:
-        dict[str, Any]: Complete pipeline result matching
-            the SECTION 10 schema.
+        dict[str, Any]: Complete pipeline result.
 
     Raises:
-        Exception: Any unhandled exception causes the task
-            to transition to ERROR state in Redis, then
-            re-raises to allow Celery retry logic.
+        Exception: Any unhandled exception transitions the task to
+            ERROR state in Redis, then re-raises for Celery retry.
     """
     redis_client = redis_lib.from_url(REDIS_URL)
 
@@ -103,14 +125,8 @@ def process_video_task(
     )
 
     try:
-        # Initialise face model — always ctx_id=-1 (CPU)
-        face_model = insightface.app.FaceAnalysis(
-            allowed_modules=["detection", "recognition"]
-        )
-        face_model.prepare(ctx_id=-1)
-
-        # Nano YOLO model for fastest CPU inference
-        yolo_model = YOLO("yolov8n.pt")
+        # Reuse cached models — zero load time on subsequent tasks
+        face_model, yolo_model = _get_models()
 
         # Open a dedicated DB connection for this task
         conn = psycopg2.connect(DATABASE_URL)

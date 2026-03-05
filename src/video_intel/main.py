@@ -10,13 +10,16 @@ import json
 import logging
 import os
 import uuid
+import asyncio
 from pathlib import Path
 from typing import Any
 
+import cv2
 import insightface
 import numpy as np
 import psycopg2
 import redis as redis_lib
+from ultralytics import YOLO
 from dotenv import load_dotenv
 from fastapi import (
     FastAPI,
@@ -24,6 +27,8 @@ from fastapi import (
     Form,
     HTTPException,
     UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -67,6 +72,7 @@ FACE_THRESHOLD: float = float(
 # Populated in the startup event; typed as Any to avoid
 # import-time side effects in test environments.
 face_model: Any = None
+yolo_model: Any = None
 redis_client: Any = None
 db_conn: Any = None
 
@@ -106,7 +112,7 @@ async def startup_event() -> None:
         RuntimeError: If any critical resource cannot be
             initialised.
     """
-    global face_model, redis_client, db_conn
+    global face_model, yolo_model, redis_client, db_conn
 
     for directory in (UPLOAD_DIR, PROCESSED_DIR, ACTORS_DIR):
         Path(directory).mkdir(parents=True, exist_ok=True)
@@ -138,6 +144,9 @@ async def startup_event() -> None:
     # faces in non-ideal angles (podcast close-ups, side views)
     face_model.prepare(ctx_id=-1, det_thresh=0.25)
     logger.info("InsightFace model prepared (CPU).")
+
+    yolo_model = YOLO("yolov8m.pt")
+    logger.info("YOLO model loaded for live inference.")
 
     actors = get_all_actors(db_conn)
     logger.info(
@@ -299,6 +308,51 @@ async def get_status(
         ) from exc
 
 
+@app.websocket("/ws/realtime/{video_id}")
+async def ws_realtime(websocket: WebSocket, video_id: str) -> None:
+    """Stream real-time processing results to the client.
+
+    Args:
+        websocket: The WebSocket connection.
+        video_id: The unique video identifier to subscribe to.
+    """
+    await websocket.accept()
+    pubsub = redis_client.pubsub()
+    pubsub.subscribe(f"realtime:{video_id}")
+
+    try:
+        while True:
+            # timeout=0 → non-blocking check; never blocks the event loop.
+            # Using timeout=1.0 (the old value) would freeze the entire
+            # uvicorn event loop for 1 second on every iteration, stalling
+            # ALL concurrent WebSocket and HTTP connections.
+            message = pubsub.get_message(
+                ignore_subscribe_messages=True, timeout=0
+            )
+            if message is not None:
+                raw = message["data"]
+                data: str = (
+                    raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                )
+                if data == "DONE":
+                    await websocket.send_text('{"type": "DONE"}')
+                    break
+                await websocket.send_text(data)
+            else:
+                # Yield to the event loop; 50 ms gives ~20 updates/sec max
+                await asyncio.sleep(0.05)
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected for video_id=%s", video_id)
+    except Exception as exc:
+        logger.exception("WebSocket error: %s", exc)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+    finally:
+        pubsub.unsubscribe()
+
+
 @app.get("/metadata/{video_id}")
 async def get_metadata(
     video_id: str,
@@ -369,8 +423,6 @@ async def add_actor(
             status_code=500,
             detail="Failed to save actor reference photo.",
         ) from exc
-
-    import cv2
 
     img = cv2.imread(str(photo_path))
     if img is None:
@@ -465,6 +517,137 @@ async def health_check() -> dict[str, Any]:
         "db": db_status,
         "actors_loaded": actors_loaded,
     }
+
+
+# ---------------------------------------------------------------------------
+# Live inference WebSocket
+# ---------------------------------------------------------------------------
+
+
+@app.websocket("/ws/infer")
+async def ws_infer(websocket: WebSocket) -> None:
+    """Real-time per-frame inference WebSocket.
+
+    The browser sends raw JPEG bytes (binary message) for each video
+    frame it wants analysed.  The server runs InsightFace + YOLO and
+    immediately replies with a JSON payload containing ``faces`` and
+    ``objects`` arrays.  The client draws bounding boxes in real time
+    without waiting for the batch pipeline to finish.
+
+    Face-to-actor matching uses the same vectorised cosine similarity
+    as the batch pipeline; the actor matrix is built once per
+    WebSocket connection from the live DB rows.
+
+    CPU-heavy inference is offloaded to a thread pool via
+    ``asyncio.to_thread`` so the event loop is never blocked.
+    """
+    await websocket.accept()
+    logger.info("Live inference WebSocket connected.")
+
+    # Build actor matrix once per connection from current DB state.
+    actors = get_all_actors(db_conn)
+    actor_db_local: dict[str, list[float]] = {
+        row["name"]: row["embedding"]
+        for row in actors
+        if row.get("embedding") is not None
+    }
+    actor_names_local: list[str] = list(actor_db_local.keys())
+    actor_matrix_local: np.ndarray | None = None
+    if actor_names_local:
+        raw = np.array(
+            [actor_db_local[n] for n in actor_names_local], dtype=np.float32
+        )
+        norms = np.linalg.norm(raw, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        actor_matrix_local = raw / norms
+
+    yolo_conf: float = float(os.getenv("YOLO_CONFIDENCE", "0.5"))
+
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+
+            # Decode JPEG → BGR frame
+            nparr = np.frombuffer(data, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if frame is None:
+                await websocket.send_text(
+                    '{"faces":[],"objects":[]}'
+                )
+                continue
+
+            # ── Face detection + actor matching ──────────────────────
+            faces_out: list[dict[str, Any]] = []
+            try:
+                detected = await asyncio.to_thread(face_model.get, frame)
+                for face in detected:
+                    bbox = face.bbox
+                    x1, y1 = float(bbox[0]), float(bbox[1])
+                    x2, y2 = float(bbox[2]), float(bbox[3])
+                    tlwh = [
+                        round(x1, 1), round(y1, 1),
+                        round(x2 - x1, 1), round(y2 - y1, 1),
+                    ]
+                    actor_name: str | None = None
+                    score: float = 0.0
+                    if actor_matrix_local is not None:
+                        query = np.array(
+                            face.normed_embedding, dtype=np.float32
+                        )
+                        cosine_scores = actor_matrix_local @ query
+                        best_idx = int(np.argmax(cosine_scores))
+                        best_score = float(cosine_scores[best_idx])
+                        if best_score >= FACE_THRESHOLD:
+                            actor_name = actor_names_local[best_idx]
+                            score = round(best_score, 2)
+                    faces_out.append(
+                        {"actor": actor_name, "score": score, "bbox": tlwh}
+                    )
+            except Exception as exc:
+                logger.warning("Live face detection error: %s", exc)
+
+            # ── Object detection ──────────────────────────────────────
+            objects_out: list[dict[str, Any]] = []
+            try:
+                yolo_results = await asyncio.to_thread(
+                    yolo_model, frame, verbose=False
+                )
+                for result in yolo_results:
+                    for box in result.boxes:
+                        conf = float(box.conf[0])
+                        if conf < yolo_conf:
+                            continue
+                        cls = int(box.cls[0])
+                        label: str = result.names.get(cls, "")
+                        x1, y1, x2, y2 = (
+                            float(box.xyxy[0][0]),
+                            float(box.xyxy[0][1]),
+                            float(box.xyxy[0][2]),
+                            float(box.xyxy[0][3]),
+                        )
+                        objects_out.append({
+                            "label": label,
+                            "confidence": round(conf, 2),
+                            "bbox": [
+                                round(x1, 1), round(y1, 1),
+                                round(x2 - x1, 1), round(y2 - y1, 1),
+                            ],
+                        })
+            except Exception as exc:
+                logger.warning("Live YOLO detection error: %s", exc)
+
+            await websocket.send_text(
+                json.dumps({"faces": faces_out, "objects": objects_out})
+            )
+
+    except WebSocketDisconnect:
+        logger.info("Live inference WebSocket disconnected.")
+    except Exception as exc:
+        logger.exception("Live inference error: %s", exc)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
