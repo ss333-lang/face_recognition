@@ -531,6 +531,20 @@
         const canvas = document.getElementById('overlay');
         const ctx = canvas.getContext('2d');
 
+        // Polyfill for roundRect (older browsers / Safari)
+        if (!CanvasRenderingContext2D.prototype.roundRect) {
+            CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h, r) {
+                if (w < 2 * r) r = w / 2;
+                if (h < 2 * r) r = h / 2;
+                this.moveTo(x + r, y);
+                this.arcTo(x + w, y, x + w, y + h, r);
+                this.arcTo(x + w, y + h, x, y + h, r);
+                this.arcTo(x, y + h, x, y, r);
+                this.arcTo(x, y, x + w, y, r);
+                return this;
+            };
+        }
+
         // ── Health ──────────────────────────────────────────
         (async () => {
             try {
@@ -599,10 +613,13 @@
 
         // ── Canvas resize ────────────────────────────────────
         video.addEventListener('loadedmetadata', () => {
-            // Set canvas internal resolution = native video resolution.
-            // CSS sizes the canvas to match the displayed video element.
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
+            syncCanvasSize();
+        });
+
+        // Force sync on play as well (fixes initial sizing issues)
+        video.addEventListener('play', () => {
             syncCanvasSize();
         });
 
@@ -658,33 +675,40 @@
         }
 
         function drawBox(x, y, w, h, color, label) {
-            if (w < 8 || h < 8) return; // skip degenerate boxes
+            if (w < 8 || h < 8) return;
 
-            // Glow rectangle
             ctx.save();
             ctx.strokeStyle = color;
-            ctx.lineWidth = 2.5;
-            ctx.shadowColor = color;
-            ctx.shadowBlur = 10;
+            ctx.lineWidth = 3;
+            ctx.shadowColor = 'rgba(0,0,0,0.5)';
+            ctx.shadowBlur = 4;
             ctx.strokeRect(x, y, w, h);
             ctx.restore();
 
-            // Label pill
-            ctx.font = 'bold 13px system-ui, sans-serif';
-            const tw = ctx.measureText(label).width;
-            const ph = 22;
-            const pw = tw + 12;
-            const py = y >= ph + 2 ? y - ph : y + h;   // above or below box
+            // Label
+            ctx.font = '700 12px Inter, system-ui, sans-serif';
+            const textMetrics = ctx.measureText(label);
+            const textWidth = textMetrics.width;
+            const textHeight = 14; 
+            const paddingX = 8;
+            const paddingY = 6;
+            
+            const pillWidth = textWidth + (paddingX * 2);
+            const pillHeight = textHeight + (paddingY * 2);
+            
+            let pillX = x;
+            let pillY = y - pillHeight - 2;
+            
+            // Flip if off-screen top
+            if (pillY < 0) pillY = y + h + 2;
 
-            // Pill background
-            ctx.fillStyle = '#000000cc';
+            ctx.fillStyle = color;
             ctx.beginPath();
-            ctx.roundRect(x - 1, py, pw, ph, 4);
+            ctx.roundRect(pillX, pillY, pillWidth, pillHeight, 4);
             ctx.fill();
 
-            // Pill text
-            ctx.fillStyle = color;
-            ctx.fillText(label, x + 5, py + 15);
+            ctx.fillStyle = '#000';
+            ctx.fillText(label, pillX + paddingX, pillY + paddingY + 10);
         }
 
         // ── Actor panel ──────────────────────────────────────
@@ -797,8 +821,7 @@
                 }).join('');
                 const oChips = objects.map(o => {
                     const label = (o && typeof o === 'object') ? o.label : o;
-                    return `<span class="obj-chip">${label}</span>`;
-                }).join('');
+                    return `<span class="obj-chip">${label}<n>`           }).join('');
 
                 html += `
           <div class="tl-item">
